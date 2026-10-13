@@ -90,6 +90,9 @@ import kotlinx.serialization.json.JsonNames
  * @property liveSessionResumptionUpdate A resumption handle issued by the live server.
  * @property voiceActivity A voice activity signal from the live server, marking where it detected
  *   speech starting or stopping.
+ * @property isolationScope Limits which agents see this event in their model history: an agent sees
+ *   it only when running in the same scope, and an unscoped agent sees only unscoped events. Set by
+ *   the framework; not meant to be set directly.
  */
 @Serializable
 data class Event
@@ -135,6 +138,9 @@ constructor(
   @JsonNames("live_session_resumption_update")
   val liveSessionResumptionUpdate: LiveServerSessionResumptionUpdate? = null,
   @JsonNames("voice_activity") val voiceActivity: VoiceActivity? = null,
+  @OptIn(ExperimentalSerializationApi::class)
+  @JsonNames("isolation_scope")
+  val isolationScope: String? = null,
 ) {
 
   /** Returns all function calls from this event. */
@@ -260,6 +266,7 @@ constructor(
       .liveSessionId(liveSessionId)
       .liveSessionResumptionUpdate(liveSessionResumptionUpdate)
       .voiceActivity(voiceActivity)
+      .isolationScope(isolationScope)
 
   /**
    * Fluent builder for [Event], provided primarily for Java callers. Any property left unset falls
@@ -298,6 +305,7 @@ constructor(
     private var liveSessionId: String? = null
     private var liveSessionResumptionUpdate: LiveServerSessionResumptionUpdate? = null
     private var voiceActivity: VoiceActivity? = null
+    private var isolationScope: String? = null
 
     fun id(id: String): Builder = apply { this.id = id }
 
@@ -387,6 +395,10 @@ constructor(
       this.voiceActivity = voiceActivity
     }
 
+    fun isolationScope(isolationScope: String?): Builder = apply {
+      this.isolationScope = isolationScope
+    }
+
     fun build(): Event =
       Event(
         id = id,
@@ -419,6 +431,7 @@ constructor(
         liveSessionId = liveSessionId,
         liveSessionResumptionUpdate = liveSessionResumptionUpdate,
         voiceActivity = voiceActivity,
+        isolationScope = isolationScope,
       )
   }
 

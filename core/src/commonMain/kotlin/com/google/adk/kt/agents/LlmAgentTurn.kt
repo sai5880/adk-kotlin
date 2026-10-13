@@ -67,6 +67,7 @@ import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.SessionResumptionConfig
 import com.google.adk.kt.types.Transcription
 import com.google.adk.kt.types.UsageMetadata
+import com.google.adk.kt.workflow.BranchPath
 import com.google.genai.kotlin.GenAiApiException
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
@@ -246,6 +247,13 @@ internal class LlmAgentTurn(
     // user-injected resume) does not pause; the model summarizes it instead.
     val events = context.getEvents(currentInvocation = true, currentBranch = true)
     val lastEvent = events.lastOrNull()
+    // A user answer on the sub-branch of a paused single-turn tool replays the call that opened it,
+    // as Python's `_is_sub_branch_answer` does.
+    val subBranchCall = lastEvent?.let { callThatOpenedBranchOf(it, events) }
+    if (subBranchCall != null) {
+      emitAll(handleActions(subBranchCall, getToolMap(request)))
+      return@flow
+    }
     if (context.isResumable && lastEvent != null && lastEvent.functionCalls().isNotEmpty()) {
       emitAll(handleActions(lastEvent, getToolMap(request)))
       return@flow
@@ -253,6 +261,23 @@ internal class LlmAgentTurn(
 
     // STAGES 3 & 4: Model Invocation & Post-processing
     invokeAndProcessModel(request).collect { emit(it) }
+  }
+
+  /**
+   * Returns this agent's call event cut to the calls that opened the branch [answer] came back on,
+   * or null unless [answer] is a user's function response on such a branch.
+   */
+  private fun callThatOpenedBranchOf(answer: Event, events: List<Event>): Event? {
+    if (answer.author != Role.USER || answer.functionResponses().isEmpty()) return null
+    val runIds = BranchPath.runIds(answer.branch)
+    if (runIds.isEmpty()) return null
+    val callEvent =
+      events.lastOrNull { event ->
+        event.author == agent.name && event.functionCalls().any { it.id in runIds }
+      } ?: return null
+    val content = callEvent.content ?: return null
+    val parts = content.parts.filter { it.functionCall == null || it.functionCall.id in runIds }
+    return callEvent.copy(content = content.copy(parts = parts))
   }
 
   private suspend fun prepareRequest(emitEvent: suspend (Event) -> Unit): RequestOrResponse {
@@ -1737,21 +1762,24 @@ internal class LlmAgentTurn(
     // SequentialAgent/LoopAgent (or any workflow agent that doesn't itself emit a transfer back)
     // would leave the parent unable to resume.
 
-    // If a tool requested a transfer to another agent, execute that agent's loop.
-    functionResponseEvent?.actions?.transferToAgent?.let { agentName ->
-      // Live runs hand over to the target in `runLiveSession`, so they skip this path.
-      if (context.liveRequestQueue != null) return@let
-      require(agentName != agent.name) { "Agent '${agent.name}' cannot transfer to itself." }
-      // Declared targets only, so the model cannot reach any other agent in the tree.
-      val targetAgent =
-        requireNotNull(findTransferTargets(agent).firstOrNull { it.name == agentName }) {
-          if (agent.rootAgent.findAgent(agentName) == null) {
-            "Agent '${agent.name}' requested a transfer to an agent that is not in the agent tree."
-          } else {
-            "Agent '${agent.name}' is not allowed to transfer to the requested agent."
+    // A tool's transfer runs the target here, unless a node loop follows it.
+    if (!agent.runsInNodeLoop(context)) {
+      functionResponseEvent?.actions?.transferToAgent?.let { agentName ->
+        // Live runs hand over to the target in `runLiveSession`, so they skip this path.
+        if (context.liveRequestQueue != null) return@let
+        require(agentName != agent.name) { "Agent '${agent.name}' cannot transfer to itself." }
+        // Declared targets only, so the model cannot reach any other agent in the tree.
+        val targetAgent =
+          requireNotNull(findTransferTargets(agent).firstOrNull { it.name == agentName }) {
+            if (agent.rootAgent.findAgent(agentName) == null) {
+              "Agent '${agent.name}' requested a transfer to an agent that is not in the agent " +
+                "tree."
+            } else {
+              "Agent '${agent.name}' is not allowed to transfer to the requested agent."
+            }
           }
-        }
-      emitAll(targetAgent.runAsync(context))
+        emitAll(targetAgent.runAsync(context))
+      }
     }
   }
 

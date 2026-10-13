@@ -16,10 +16,12 @@
 package com.google.adk.kt.processors
 
 import com.google.adk.kt.agents.LlmAgent.IncludeContents
+import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.artifacts.isAdkLiveArtifact
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.applyRewinds
 import com.google.adk.kt.serialization.Json
+import com.google.adk.kt.serialization.anyToJsonElement
 import com.google.adk.kt.tools.TransferToAgentTool
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FunctionCall
@@ -33,6 +35,9 @@ import com.google.adk.kt.types.Role
  * - Filtering "invisible" parts (pure thoughts).
  * - Rearranging/merging function response events (parallel calls).
  * - Merging stored live transcriptions into `user` and `model` text turns.
+ * - Keeping only the events stamped with the agent's isolation scope, and opening a scoped history
+ *   with the task the agent was given.
+ * - Dropping what a tool published on its own sub-branch, which reaches the model as its response.
  */
 internal class HistoryRewriterProcessor {
   fun rewrite(
@@ -40,18 +45,43 @@ internal class HistoryRewriterProcessor {
     agentName: String,
     currentBranch: String?,
     includeContents: IncludeContents = IncludeContents.DEFAULT,
+    nodePath: String? = null,
+    singleTurnNode: Boolean = false,
+    isolationScope: String? = null,
+    userContent: Content? = null,
   ): List<Content> {
+    val toolCallIds =
+      events.flatMapTo(mutableSetOf()) { e -> e.functionCalls().mapNotNull { it.id } }
+    // A tool's run on its own sub-branch reaches the model only as the tool's response.
+    val visibleEvents = events.filterNot {
+      isToolSubBranchEvent(currentBranch, it, agentName, toolCallIds)
+    }
     val workingEvents =
       when (includeContents) {
-        IncludeContents.DEFAULT -> events
-        IncludeContents.NONE -> getCurrentTurnEvents(events, agentName, currentBranch)
+        IncludeContents.DEFAULT -> visibleEvents
+        IncludeContents.NONE ->
+          getCurrentTurnEvents(
+            filterSingleTurnNodeEvents(visibleEvents, nodePath, singleTurnNode),
+            agentName,
+            currentBranch,
+            nodePath,
+            isolationScope,
+          )
       }
+    // No current turn means no contents at all, not even a scoped agent's task input.
+    if (workingEvents.isEmpty() && includeContents == IncludeContents.NONE) return emptyList()
 
-    val rewindFilteredEvents = applyRewinds(workingEvents)
+    val rewindFilteredEvents =
+      filterSingleTurnNodeEvents(
+        applyRewinds(workingEvents),
+        nodePath,
+        singleTurnNode,
+        keepAncestors = true,
+      )
 
     // Filter raw events
     val rawFilteredEvents = rewindFilteredEvents.filter {
-      shouldIncludeEventInContext(currentBranch, it)
+      shouldIncludeEventInContext(currentBranch, it, nodePath, isolationScope)
     }
 
     // Replace each compaction event with its summary and drop the raw events it covers.
@@ -86,14 +116,51 @@ internal class HistoryRewriterProcessor {
     }
 
     // Rearrange for latest function response (merge scenarios) and async function responses
-    return filteredEvents
-      .let { rearrangeEventsForLatestFunctionResponse(it) }
-      .let { rearrangeEventsForAsyncFunctionResponsesInHistory(it) }
-      .mapNotNull { event ->
-        val content = event.content ?: return@mapNotNull null
-        stripClientFunctionCallIds(content)
-      }
+    val contents =
+      filteredEvents
+        // A node's history filters can hide a call while its response stays visible.
+        .let { if (nodePath != null) dropOrphanedFunctionResponses(it) else it }
+        .let { rearrangeEventsForLatestFunctionResponse(it) }
+        .let { rearrangeEventsForAsyncFunctionResponsesInHistory(it) }
+        .mapNotNull { event ->
+          val content = event.content ?: return@mapNotNull null
+          stripClientFunctionCallIds(content)
+        }
+    // The unscoped delegating call was filtered out, so restate the task as the opening turn.
+    val taskInput = isolationScope?.let {
+      buildTaskInputContent(workingEvents, it, singleTurnNode, userContent)
+    }
+    return if (taskInput != null) listOf(taskInput) + contents else contents
   }
+
+  /**
+   * Returns the task a scoped agent was given, as a user turn: the arguments of the function call
+   * whose id is [isolationScope], else [userContent]. A single-turn agent is also told that no
+   * reply will follow.
+   */
+  private fun buildTaskInputContent(
+    events: List<Event>,
+    isolationScope: String,
+    singleTurnNode: Boolean,
+    userContent: Content?,
+  ): Content? {
+    val delegatingCall = events.firstNotNullOfOrNull { event ->
+      event.functionCalls().firstOrNull { it.id == isolationScope && it.args.isNotEmpty() }
+    }
+    val parts =
+      when {
+        delegatingCall != null -> listOf(Part(text = taskArgsText(delegatingCall.args)))
+        userContent != null && userContent.parts.isNotEmpty() -> userContent.parts
+        else -> return null
+      }
+    val nudge = if (singleTurnNode) listOf(Part(text = SINGLE_TURN_NUDGE)) else emptyList()
+    return Content(role = Role.USER, parts = parts + nudge)
+  }
+
+  /** Renders task arguments as JSON, or as their text when a value has no JSON form. */
+  @OptIn(FrameworkInternalApi::class)
+  private fun taskArgsText(args: Map<String, Any?>): String =
+    runCatching { anyToJsonElement(args).toString() }.getOrElse { args.toString() }
 
   /**
    * Merges each run of transcription events without visible content into one text event, input
@@ -352,6 +419,8 @@ internal class HistoryRewriterProcessor {
     events: List<Event>,
     agentName: String,
     currentBranch: String?,
+    nodePath: String?,
+    isolationScope: String?,
   ): List<Event> {
     // A posted-back result continues its call's turn, so the turn reaches back to that call.
     val callIds =
@@ -368,11 +437,18 @@ internal class HistoryRewriterProcessor {
       if (unmatchedResultIds.isNotEmpty() || isSubmittedResult || isDirectTransfer(events[i])) {
         continue
       }
-      if (!isCurrentTurnBoundary(events[i], agentName, currentBranch)) continue
-      val start = runStart(events, i, currentBranch)
+      if (!isCurrentTurnBoundary(events[i], agentName, currentBranch, nodePath, isolationScope)) {
+        continue
+      }
+      val start = runStart(events, i, currentBranch, nodePath, isolationScope)
       // A blank spoken run is dropped by the merge, so it cannot start the turn.
       val kind = transcriptionKind(events[i])
-      if (kind != null && runText(events, start, i, kind, currentBranch).isBlank()) continue
+      if (
+        kind != null &&
+          runText(events, start, i, kind, currentBranch, nodePath, isolationScope).isBlank()
+      ) {
+        continue
+      }
       return events.subList(start, events.size)
     }
     return emptyList()
@@ -397,10 +473,16 @@ internal class HistoryRewriterProcessor {
    * Returns where the transcription run that ends at [end] starts, so the current turn keeps all of
    * a spoken turn rather than its last chunk. Events left out of the context do not break the run.
    */
-  private fun runStart(events: List<Event>, end: Int, currentBranch: String?): Int {
+  private fun runStart(
+    events: List<Event>,
+    end: Int,
+    currentBranch: String?,
+    nodePath: String?,
+    isolationScope: String?,
+  ): Int {
     var start = end
     for (i in end - 1 downTo 0) {
-      if (!shouldIncludeEventInContext(currentBranch, events[i])) continue
+      if (!shouldIncludeEventInContext(currentBranch, events[i], nodePath, isolationScope)) continue
       if (!continuesTranscriptionRun(events[i], events[start])) break
       start = i
     }
@@ -414,10 +496,12 @@ internal class HistoryRewriterProcessor {
     end: Int,
     kind: TranscriptionKind,
     currentBranch: String?,
+    nodePath: String?,
+    isolationScope: String?,
   ): String =
     (start..end)
       .map { events[it] }
-      .filter { shouldIncludeEventInContext(currentBranch, it) }
+      .filter { shouldIncludeEventInContext(currentBranch, it, nodePath, isolationScope) }
       .joinToString("") { kind.textOf(it) }
 
   /**
@@ -435,8 +519,10 @@ internal class HistoryRewriterProcessor {
     event: Event,
     agentName: String,
     currentBranch: String?,
+    nodePath: String?,
+    isolationScope: String?,
   ): Boolean {
-    if (!shouldIncludeEventInContext(currentBranch, event)) return false
+    if (!shouldIncludeEventInContext(currentBranch, event, nodePath, isolationScope)) return false
     if (event.author == Role.USER) return true
     return isOtherAgentReply(agentName, event) &&
       (transcriptionKind(event) != null || presentOtherAgentMessage(event) != null)
@@ -528,12 +614,103 @@ internal class HistoryRewriterProcessor {
    * outcome the framework applies itself), request_input carries a free-form answer the model must
    * read to continue. Matches Python, Java, and Go ADK.
    */
-  private fun shouldIncludeEventInContext(currentBranch: String?, event: Event): Boolean {
+  private fun shouldIncludeEventInContext(
+    currentBranch: String?,
+    event: Event,
+    nodePath: String?,
+    isolationScope: String?,
+  ): Boolean {
+    if (event.isolationScope != isolationScope) return false
     return !(containsEmptyContent(event) ||
       !isEventBelongsToBranch(currentBranch, event) ||
+      isOtherNodeInput(event, nodePath) ||
       isAdkFrameworkEvent(event) ||
       isAuthEvent(event) ||
       isRequestConfirmationEvent(event))
+  }
+
+  /**
+   * Whether [event] was published below [currentBranch] by a tool that ran a node on its own
+   * sub-branch, `<tool>@<function call id>`, such as a single-turn agent run as a tool. A segment
+   * naming [agentName] is the agent's own branch, not a tool's, as in ADK Python.
+   */
+  private fun isToolSubBranchEvent(
+    currentBranch: String?,
+    event: Event,
+    agentName: String,
+    toolCallIds: Set<String>,
+  ): Boolean {
+    val branch = event.branch
+    if (branch.isNullOrEmpty()) return false
+    val segments = branch.split('.')
+    val base = if (currentBranch.isNullOrEmpty()) emptyList() else currentBranch.split('.')
+    if (segments.size <= base.size || segments.subList(0, base.size) != base) return false
+    return segments.drop(base.size).any { segment ->
+      val separator = segment.lastIndexOf('@')
+      separator >= 0 &&
+        segment.substring(separator + 1) in toolCallIds &&
+        segment.substring(0, separator) != agentName
+    }
+  }
+
+  /** Whether [event] is a user turn that a workflow node other than [nodePath] injected. */
+  private fun isOtherNodeInput(event: Event, nodePath: String?): Boolean {
+    val path = event.nodeInfo?.path
+    return event.author == Role.USER &&
+      event.functionResponses().isEmpty() &&
+      !path.isNullOrEmpty() &&
+      path != nodePath
+  }
+
+  /**
+   * Keeps only root events and the events of [nodePath] and its descendants, and with
+   * [keepAncestors] those of its ancestors, when the agent runs as a single-turn node on any
+   * branch, so it does not see other nodes' turns.
+   */
+  private fun filterSingleTurnNodeEvents(
+    events: List<Event>,
+    nodePath: String?,
+    singleTurnNode: Boolean,
+    keepAncestors: Boolean = false,
+  ): List<Event> {
+    if (!singleTurnNode || nodePath == null) return events
+    return events.filter { event ->
+      val path = event.nodeInfo?.path
+      path.isNullOrEmpty() ||
+        path == nodePath ||
+        path.startsWith("$nodePath/") ||
+        (keepAncestors && nodePath.startsWith("$path/"))
+    }
+  }
+
+  /** Drops function responses that answer no earlier function call in [events]. */
+  private fun dropOrphanedFunctionResponses(events: List<Event>): List<Event> {
+    val callIds = mutableSetOf<String>()
+    val idlessCallNames = mutableSetOf<String>()
+    return events.mapNotNull { event ->
+      val content = event.content
+      val kept =
+        if (content == null || event.functionResponses().isEmpty()) {
+          event
+        } else {
+          val parts =
+            content.parts.filter { part ->
+              val response = part.functionResponse ?: return@filter true
+              val id = response.id
+              if (id.isNullOrEmpty()) response.name in idlessCallNames else id in callIds
+            }
+          when (parts.size) {
+            0 -> null
+            content.parts.size -> event
+            else -> event.copy(content = content.copy(parts = parts))
+          }
+        }
+      for (call in event.functionCalls()) {
+        val id = call.id
+        if (id.isNullOrEmpty()) idlessCallNames += call.name else callIds += id
+      }
+      kept
+    }
   }
 
   /**
@@ -878,5 +1055,8 @@ internal class HistoryRewriterProcessor {
 
   companion object {
     private const val AF_FUNCTION_CALL_ID_PREFIX = "adk-"
+    private const val SINGLE_TURN_NUDGE =
+      "Important: You will not receive any user replies or clarifications." +
+        " Complete the task using only the information provided above."
   }
 }
